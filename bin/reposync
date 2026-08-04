@@ -1,0 +1,320 @@
+#!/bin/bash
+
+set -u
+
+VERSION="0.1.0"
+LABEL="io.github.peteallport.reposync"
+INTERVAL_SECONDS=600
+
+CONFIG_DIR="${REPOSYNC_CONFIG_DIR:-$HOME/.config/reposync}"
+STATE_DIR="${REPOSYNC_STATE_DIR:-$HOME/.local/state/reposync}"
+LOG_DIR="${REPOSYNC_LOG_DIR:-$HOME/Library/Logs/RepoSync}"
+CONFIG_FILE="$CONFIG_DIR/repos"
+PAUSED_FILE="$STATE_DIR/paused"
+LAST_RUN_FILE="$STATE_DIR/last-run.tsv"
+LOG_FILE="$LOG_DIR/reposync.log"
+WORKER="${REPOSYNC_WORKER_PATH:-$HOME/.local/libexec/reposync-worker}"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+SERVICE_TARGET="gui/$(id -u)/$LABEL"
+
+usage() {
+    cat <<'EOF'
+RepoSync keeps selected Git repositories fetched and safely fast-forwards clean main branches.
+
+Usage:
+  reposync status
+  reposync run
+  reposync pause
+  reposync resume
+  reposync logs [--follow]
+  reposync list
+  reposync add <repository>...
+  reposync remove <repository>...
+  reposync doctor
+  reposync uninstall [--purge]
+  reposync version
+
+Safety:
+  Repositories with staged, unstaged, or untracked changes are fetch-only.
+  RepoSync never stashes, switches branches, rebases, resets, force-updates,
+  or creates merge commits.
+EOF
+}
+
+ensure_local_dirs() {
+    mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR"
+    touch "$CONFIG_FILE"
+}
+
+service_loaded() {
+    launchctl print "$SERVICE_TARGET" >/dev/null 2>&1
+}
+
+resolve_repository() {
+    local candidate="$1"
+    local root
+
+    root=$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null) || return 1
+    (cd "$root" && pwd -P)
+}
+
+repository_exists_in_config() {
+    local root="$1"
+    grep -F -x -q -- "$root" "$CONFIG_FILE" 2>/dev/null
+}
+
+command_add() {
+    local candidate root
+    [ "$#" -gt 0 ] || {
+        echo "reposync add: provide at least one Git repository" >&2
+        return 2
+    }
+
+    ensure_local_dirs
+    for candidate in "$@"; do
+        root=$(resolve_repository "$candidate") || {
+            echo "Not a Git working tree: $candidate" >&2
+            continue
+        }
+
+        if repository_exists_in_config "$root"; then
+            echo "Already configured: $root"
+        else
+            printf '%s\n' "$root" >> "$CONFIG_FILE"
+            echo "Added: $root"
+        fi
+    done
+}
+
+command_remove() {
+    local candidate root temp line removed
+    [ "$#" -gt 0 ] || {
+        echo "reposync remove: provide at least one repository" >&2
+        return 2
+    }
+
+    ensure_local_dirs
+    for candidate in "$@"; do
+        root=$(resolve_repository "$candidate" 2>/dev/null || printf '%s' "$candidate")
+        temp=$(mktemp "$CONFIG_DIR/repos.XXXXXX") || return 1
+        removed=0
+
+        while IFS= read -r line || [ -n "$line" ]; do
+            if [ "$line" = "$root" ]; then
+                removed=1
+            else
+                printf '%s\n' "$line" >> "$temp"
+            fi
+        done < "$CONFIG_FILE"
+
+        mv "$temp" "$CONFIG_FILE"
+        if [ "$removed" -eq 1 ]; then
+            echo "Removed: $root"
+        else
+            echo "Not configured: $root"
+        fi
+    done
+}
+
+command_list() {
+    local line count=0
+    ensure_local_dirs
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ""|\#*) continue ;;
+        esac
+        count=$((count + 1))
+        printf '%d. %s\n' "$count" "$line"
+    done < "$CONFIG_FILE"
+
+    [ "$count" -gt 0 ] || echo "No repositories configured."
+}
+
+command_run() {
+    ensure_local_dirs
+    if [ ! -x "$WORKER" ]; then
+        echo "RepoSync worker is not installed at $WORKER" >&2
+        return 1
+    fi
+    "$WORKER" --manual
+}
+
+wait_for_worker() {
+    local attempts=0
+    while [ -d "$STATE_DIR/lock" ] && [ "$attempts" -lt 30 ]; do
+        sleep 1
+        attempts=$((attempts + 1))
+    done
+    [ ! -d "$STATE_DIR/lock" ]
+}
+
+command_pause() {
+    ensure_local_dirs
+    touch "$PAUSED_FILE"
+    launchctl disable "$SERVICE_TARGET" >/dev/null 2>&1 || true
+
+    if ! wait_for_worker; then
+        echo "RepoSync is paused; the active Git command will finish before unloading."
+        return 0
+    fi
+
+    if service_loaded; then
+        launchctl bootout "$SERVICE_TARGET" >/dev/null 2>&1 || {
+            echo "RepoSync is paused, but launchd did not unload the service cleanly." >&2
+            return 1
+        }
+    fi
+    echo "RepoSync scheduling paused. Manual 'reposync run' remains available."
+}
+
+command_resume() {
+    ensure_local_dirs
+    if [ ! -f "$PLIST" ]; then
+        echo "LaunchAgent is not installed at $PLIST" >&2
+        return 1
+    fi
+
+    rm -f "$PAUSED_FILE"
+    launchctl enable "$SERVICE_TARGET" >/dev/null 2>&1 || true
+    if ! service_loaded; then
+        launchctl bootstrap "gui/$(id -u)" "$PLIST" || return 1
+    fi
+    echo "RepoSync scheduling resumed."
+}
+
+print_last_run() {
+    local kind field value action
+    [ -f "$LAST_RUN_FILE" ] || {
+        echo "Last run: never"
+        return
+    }
+
+    while IFS="$(printf '\t')" read -r kind field value _rest; do
+        if [ "$kind" = "meta" ]; then
+            case "$field" in
+                finished) echo "Last run: $value" ;;
+                result) echo "Result: $value" ;;
+            esac
+        fi
+    done < "$LAST_RUN_FILE"
+
+    echo
+    while IFS="$(printf '\t')" read -r kind field value action; do
+        [ "$kind" = "repo" ] || continue
+        printf '%-18s %s\n' "$value" "$field"
+        [ -z "${action:-}" ] || printf '  %s\n' "$action"
+    done < "$LAST_RUN_FILE"
+}
+
+command_status() {
+    local schedule_state load_state worker_state repo_count
+    ensure_local_dirs
+
+    if [ -f "$PAUSED_FILE" ]; then
+        schedule_state="paused"
+    else
+        schedule_state="enabled"
+    fi
+
+    if service_loaded; then
+        load_state="loaded"
+    else
+        load_state="not loaded"
+    fi
+
+    if [ -d "$STATE_DIR/lock" ]; then
+        worker_state="running"
+    else
+        worker_state="idle"
+    fi
+
+    echo "RepoSync: $schedule_state ($load_state, $worker_state)"
+    echo "Schedule: every $((INTERVAL_SECONDS / 60)) minutes"
+    repo_count=$(grep -E -c -v '^[[:space:]]*(#|$)' "$CONFIG_FILE" 2>/dev/null || true)
+    echo "Repositories: $repo_count"
+    print_last_run
+}
+
+command_logs() {
+    ensure_local_dirs
+    touch "$LOG_FILE"
+    if [ "${1:-}" = "--follow" ] || [ "${1:-}" = "-f" ]; then
+        tail -n 100 -f "$LOG_FILE"
+    else
+        tail -n 100 "$LOG_FILE"
+    fi
+}
+
+command_doctor() {
+    local failed=0
+
+    printf '%-24s ' "Git"
+    if command -v git >/dev/null 2>&1; then
+        git --version
+    else
+        echo "missing"
+        failed=1
+    fi
+
+    printf '%-24s ' "Worker"
+    if [ -x "$WORKER" ]; then echo "$WORKER"; else echo "missing"; failed=1; fi
+
+    printf '%-24s ' "LaunchAgent"
+    if [ -f "$PLIST" ]; then echo "$PLIST"; else echo "missing"; failed=1; fi
+
+    printf '%-24s ' "Configuration"
+    if [ -f "$CONFIG_FILE" ]; then echo "$CONFIG_FILE"; else echo "missing"; failed=1; fi
+
+    printf '%-24s ' "Service"
+    if service_loaded; then echo "loaded"; else echo "not loaded"; fi
+
+    printf '%-24s ' "Schedule"
+    if [ -f "$PAUSED_FILE" ]; then echo "paused"; else echo "enabled"; fi
+
+    return "$failed"
+}
+
+command_uninstall() {
+    local purge=0
+    [ "${1:-}" = "--purge" ] && purge=1
+
+    ensure_local_dirs
+    touch "$PAUSED_FILE"
+    launchctl disable "$SERVICE_TARGET" >/dev/null 2>&1 || true
+
+    if ! wait_for_worker; then
+        echo "Cannot uninstall while a sync is still running. Try again shortly." >&2
+        return 1
+    fi
+
+    if service_loaded; then
+        launchctl bootout "$SERVICE_TARGET" >/dev/null 2>&1 || return 1
+    fi
+
+    rm -f "$PLIST" "$WORKER"
+    if [ "$purge" -eq 1 ]; then
+        rm -rf "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR"
+        echo "RepoSync uninstalled; configuration, state, and logs removed."
+    else
+        echo "RepoSync uninstalled. Configuration and logs were preserved."
+    fi
+
+    rm -f "$HOME/.local/bin/reposync"
+}
+
+case "${1:-help}" in
+    add) shift; command_add "$@" ;;
+    remove|rm) shift; command_remove "$@" ;;
+    list|repos) command_list ;;
+    run|run-now) command_run ;;
+    pause) command_pause ;;
+    resume) command_resume ;;
+    status) command_status ;;
+    logs) shift; command_logs "${1:-}" ;;
+    doctor) command_doctor ;;
+    uninstall) shift; command_uninstall "${1:-}" ;;
+    version|--version|-v) echo "RepoSync $VERSION" ;;
+    help|--help|-h) usage ;;
+    *) echo "Unknown command: $1" >&2; usage >&2; exit 2 ;;
+esac

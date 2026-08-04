@@ -1,0 +1,206 @@
+#!/bin/bash
+
+set -u
+
+CONFIG_DIR="${REPOSYNC_CONFIG_DIR:-$HOME/.config/reposync}"
+STATE_DIR="${REPOSYNC_STATE_DIR:-$HOME/.local/state/reposync}"
+LOG_DIR="${REPOSYNC_LOG_DIR:-$HOME/Library/Logs/RepoSync}"
+CONFIG_FILE="$CONFIG_DIR/repos"
+PAUSED_FILE="$STATE_DIR/paused"
+LAST_RUN_FILE="$STATE_DIR/last-run.tsv"
+LOG_FILE="$LOG_DIR/reposync.log"
+LOCK_DIR="$STATE_DIR/lock"
+MANUAL=0
+
+[ "${1:-}" = "--manual" ] && MANUAL=1
+
+mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR"
+touch "$CONFIG_FILE" "$LOG_FILE"
+
+timestamp() {
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+log() {
+    printf '%s %s\n' "$(timestamp)" "$*" | tee -a "$LOG_FILE"
+}
+
+acquire_lock() {
+    local existing_pid
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        return 0
+    fi
+
+    existing_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+        log "Another sync is already running (pid $existing_pid); skipping."
+        return 1
+    fi
+
+    rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        return 0
+    fi
+
+    log "Unable to acquire the sync lock; skipping."
+    return 1
+}
+
+cleanup() {
+    rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+record_repo() {
+    local path="$1" action="$2" message="$3"
+    printf 'repo\t%s\t%s\t%s\n' "$path" "$action" "$message" >> "$RUN_FILE"
+}
+
+git_operation_in_progress() {
+    local repo="$1" marker
+    for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do
+        marker=$(git -C "$repo" rev-parse --git-path "$marker" 2>/dev/null) || return 0
+        [ -e "$marker" ] && return 0
+    done
+
+    marker=$(git -C "$repo" rev-parse --git-path rebase-merge 2>/dev/null) || return 0
+    [ -d "$marker" ] && return 0
+    marker=$(git -C "$repo" rev-parse --git-path rebase-apply 2>/dev/null) || return 0
+    [ -d "$marker" ] && return 0
+    return 1
+}
+
+sync_repository() {
+    local repo="$1" branch local_head remote_head dirty
+
+    if [ ! -d "$repo" ] || ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        log "INVALID $repo"
+        record_repo "$repo" "invalid" "Path is not a Git working tree."
+        failures=$((failures + 1))
+        return
+    fi
+
+    log "FETCH $repo"
+    if ! GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=Never git -C "$repo" fetch --prune --quiet origin; then
+        log "FETCH-FAILED $repo"
+        record_repo "$repo" "fetch failed" "Could not fetch origin; working tree untouched."
+        failures=$((failures + 1))
+        return
+    fi
+
+    branch=$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+    if [ "$branch" != "main" ]; then
+        log "FETCH-ONLY $repo branch=${branch:-detached}"
+        record_repo "$repo" "fetched only" "Checked out on ${branch:-detached HEAD}, not main."
+        return
+    fi
+
+    if git_operation_in_progress "$repo"; then
+        log "SKIP-OPERATION $repo"
+        record_repo "$repo" "fetched only" "A Git operation is in progress."
+        return
+    fi
+
+    dirty=$(git -C "$repo" status --porcelain=v1 --untracked-files=normal 2>/dev/null) || {
+        log "STATUS-FAILED $repo"
+        record_repo "$repo" "fetch failed" "Could not inspect working-tree state."
+        failures=$((failures + 1))
+        return
+    }
+    if [ -n "$dirty" ]; then
+        log "SKIP-DIRTY $repo"
+        record_repo "$repo" "fetched only" "Working tree has staged, unstaged, or untracked changes."
+        return
+    fi
+
+    if ! git -C "$repo" show-ref --verify --quiet refs/remotes/origin/main; then
+        log "SKIP-NO-REMOTE-MAIN $repo"
+        record_repo "$repo" "fetched only" "origin/main does not exist."
+        return
+    fi
+
+    local_head=$(git -C "$repo" rev-parse HEAD) || return
+    remote_head=$(git -C "$repo" rev-parse refs/remotes/origin/main) || return
+
+    if [ "$local_head" = "$remote_head" ]; then
+        log "CURRENT $repo"
+        record_repo "$repo" "current" "main already matches origin/main."
+        return
+    fi
+
+    if git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+        # Close the normal status-to-merge race as far as Git permits. Git's own
+        # index and worktree safety checks remain authoritative during the merge.
+        dirty=$(git -C "$repo" status --porcelain=v1 --untracked-files=normal 2>/dev/null) || dirty="status-failed"
+        if [ -n "$dirty" ]; then
+            log "SKIP-DIRTY-RACE $repo"
+            record_repo "$repo" "fetched only" "Working tree changed before fast-forward."
+            return
+        fi
+
+        if GIT_MERGE_AUTOEDIT=no git -C "$repo" merge --ff-only --quiet refs/remotes/origin/main; then
+            log "UPDATED $repo ${local_head}..${remote_head}"
+            record_repo "$repo" "updated" "main fast-forwarded to origin/main."
+        else
+            log "UPDATE-FAILED $repo"
+            record_repo "$repo" "update failed" "Git refused the fast-forward; inspect manually."
+            failures=$((failures + 1))
+        fi
+        return
+    fi
+
+    if git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+        log "SKIP-LOCAL-AHEAD $repo"
+        record_repo "$repo" "fetched only" "Local main is ahead of origin/main."
+    else
+        log "SKIP-DIVERGED $repo"
+        record_repo "$repo" "fetched only" "Local main has diverged from origin/main."
+    fi
+}
+
+if [ "$MANUAL" -eq 0 ] && [ -f "$PAUSED_FILE" ]; then
+    log "Scheduled sync skipped because RepoSync is paused."
+    exit 0
+fi
+
+acquire_lock || exit 0
+trap cleanup EXIT HUP INT TERM
+
+RUN_FILE=$(mktemp "$STATE_DIR/last-run.XXXXXX") || exit 1
+started=$(timestamp)
+printf 'meta\tstarted\t%s\n' "$started" > "$RUN_FILE"
+
+failures=0
+repositories=0
+while IFS= read -r repo || [ -n "$repo" ]; do
+    case "$repo" in
+        ""|\#*) continue ;;
+    esac
+
+    if [ "$MANUAL" -eq 0 ] && [ -f "$PAUSED_FILE" ]; then
+        log "Pause requested; ending before the next repository."
+        break
+    fi
+
+    repositories=$((repositories + 1))
+    sync_repository "$repo"
+done < "$CONFIG_FILE"
+
+finished=$(timestamp)
+if [ "$repositories" -eq 0 ]; then
+    result="no repositories configured"
+elif [ "$failures" -eq 0 ]; then
+    result="success"
+else
+    result="$failures failure(s)"
+fi
+
+printf 'meta\tfinished\t%s\n' "$finished" >> "$RUN_FILE"
+printf 'meta\tresult\t%s\n' "$result" >> "$RUN_FILE"
+mv "$RUN_FILE" "$LAST_RUN_FILE"
+log "DONE repositories=$repositories failures=$failures"
+
+[ "$failures" -eq 0 ]
