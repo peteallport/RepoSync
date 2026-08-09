@@ -1,4 +1,4 @@
-# RepoSync
+![RepoSync — Safe background Git sync for macOS](assets/reposync-header.png)
 
 RepoSync is a small, user-controlled macOS LaunchAgent that keeps selected Git
 repositories fetched and safely fast-forwards clean `main` working trees.
