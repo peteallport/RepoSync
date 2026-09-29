@@ -54,6 +54,23 @@ reposync run
 reposync status
 ```
 
+To add all repositories under a directory:
+
+```bash
+reposync add ~/Developer
+```
+
+`add` recursively searches directories, previews new repositories, and requires
+an explicit `Y` or `y` before registering them. `N` cancels; end-of-input cancels
+with a nonzero exit code. Other answers repeat the prompt without a timeout.
+Already registered repositories and duplicate paths are omitted from the preview.
+Discovery stops at each working-tree root, excluding repositories nested inside
+it (such as submodules and agent worktrees). Directory symlinks encountered during
+scanning and bare repositories are skipped. Explicit repository paths, including
+linked worktrees, remain supported and also require confirmation. Registration
+makes repositories eligible for the existing scheduled sync; it does not run a
+sync immediately.
+
 ## Control
 
 ```text
@@ -63,7 +80,7 @@ reposync pause               Persistently pause scheduled runs
 reposync resume              Resume scheduled runs
 reposync logs [--follow]     Read or follow the activity log
 reposync list                List configured repositories
-reposync add <path>...       Add Git working trees
+reposync add <path>...       Add repositories or scan a directory (Y/N confirmation)
 reposync remove <path>...    Remove Git working trees
 reposync doctor              Check the installation
 reposync uninstall [--purge] Remove RepoSync; preserve data unless --purge
