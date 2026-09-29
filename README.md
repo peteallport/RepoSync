@@ -71,6 +71,21 @@ linked worktrees, remain supported and also require confirmation. Registration
 makes repositories eligible for the existing scheduled sync; it does not run a
 sync immediately.
 
+To stop syncing repositories under a directory:
+
+```bash
+reposync remove ~/Developer
+```
+
+`remove` previews registered paths under that directory and requires Y/N
+confirmation using the same no-timeout behavior as `add`. It matches the saved
+registration list, including entries whose repository folders have been deleted;
+no filesystem scan is needed. Sibling directories with similar names are not
+matched. An explicit repository path removes only that repository, and a missing
+path can still remove an exact saved registration. Removal only updates the
+registration list; it never deletes repository files or interrupts a sync already
+in progress.
+
 ## Control
 
 ```text
@@ -81,7 +96,7 @@ reposync resume              Resume scheduled runs
 reposync logs [--follow]     Read or follow the activity log
 reposync list                List configured repositories
 reposync add <path>...       Add repositories or scan a directory (Y/N confirmation)
-reposync remove <path>...    Remove Git working trees
+reposync remove <path>...    Remove repositories under a directory (Y/N confirmation)
 reposync doctor              Check the installation
 reposync uninstall [--purge] Remove RepoSync; preserve data unless --purge
 ```

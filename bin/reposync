@@ -29,7 +29,7 @@ Usage:
   reposync logs [--follow]
   reposync list
   reposync add <repository-or-directory>...
-  reposync remove <repository>...
+  reposync remove <repository-or-directory>...
   reposync doctor
   reposync uninstall [--purge]
   reposync version
@@ -144,33 +144,77 @@ command_add() {
 }
 
 command_remove() {
-    local candidate root temp line removed
+    local candidate root temp line existing answer match subtree duplicate
+    local -a pending=()
     [ "$#" -gt 0 ] || {
-        echo "reposync remove: provide at least one repository" >&2
+        echo "reposync remove: provide at least one repository or directory" >&2
         return 2
     }
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "No configured repositories to remove."
+        return 0
+    fi
 
-    ensure_local_dirs
     for candidate in "$@"; do
-        root=$(resolve_repository "$candidate" 2>/dev/null || printf '%s' "$candidate")
-        temp=$(mktemp "$CONFIG_DIR/repos.XXXXXX") || return 1
-        removed=0
-
-        while IFS= read -r line || [ -n "$line" ]; do
-            if [ "$line" = "$root" ]; then
-                removed=1
-            else
-                printf '%s\n' "$line" >> "$temp"
-            fi
-        done < "$CONFIG_FILE"
-
-        mv "$temp" "$CONFIG_FILE"
-        if [ "$removed" -eq 1 ]; then
-            echo "Removed: $root"
+        subtree=0
+        if root=$(resolve_repository "$candidate"); then
+            : # Explicit repositories retain exact-match removal.
+        elif [ -d "$candidate" ]; then
+            root=$(cd "$candidate" && pwd -P) || return 1
+            subtree=1
         else
-            echo "Not configured: $root"
+            # Preserve removal of an exact registered path that no longer exists.
+            root="$candidate"
         fi
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in ""|\#*) continue ;; esac
+            match=0
+            [ "$line" = "$root" ] && match=1
+            if [ "$subtree" -eq 1 ]; then
+                case "$line" in "${root%/}/"*) match=1 ;; esac
+            fi
+            [ "$match" -eq 1 ] || continue
+            duplicate=0
+            for existing in "${pending[@]-}"; do
+                [ "$existing" = "$line" ] && duplicate=1
+            done
+            [ "$duplicate" -eq 1 ] || pending+=("$line")
+        done < "$CONFIG_FILE"
     done
+    if [ "${#pending[@]}" -eq 0 ]; then
+        echo "No matching configured repositories to remove."
+        return 0
+    fi
+
+    echo "Repositories to remove from scheduled syncs:"
+    printf '  %s\n' "${pending[@]}"
+    echo "Repository files will remain on disk."
+    while true; do
+        printf 'Remove %s repositories? [Y/N] ' "${#pending[@]}"
+        if ! IFS= read -r answer; then
+            echo
+            echo "Cancelled; no repositories removed."
+            return 1
+        fi
+        case "$answer" in
+            Y|y) break ;;
+            N|n) echo "Cancelled; no repositories removed."; return 0 ;;
+            *) echo "Please enter Y or N." ;;
+        esac
+    done
+
+    temp=$(mktemp "$CONFIG_DIR/repos.XXXXXX") || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        match=0
+        for root in "${pending[@]}"; do
+            [ "$line" = "$root" ] && match=1
+        done
+        if [ "$match" -eq 0 ]; then
+            printf '%s\n' "$line" >> "$temp" || { rm -f "$temp"; return 1; }
+        fi
+    done < "$CONFIG_FILE"
+    mv "$temp" "$CONFIG_FILE" || { rm -f "$temp"; return 1; }
+    printf 'Removed: %s\n' "${pending[@]}"
 }
 
 command_list() {
