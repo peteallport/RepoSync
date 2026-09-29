@@ -156,15 +156,91 @@ REPOSYNC_CONFIG_DIR="$CLI_CONFIG" \
 REPOSYNC_STATE_DIR="$STATE_DIR" \
 REPOSYNC_LOG_DIR="$LOG_DIR" \
 REPOSYNC_WORKER_PATH="$WORKER" \
-"$CLI" add "$clean" "$clean" >/dev/null
+"$CLI" add "$clean" "$clean" <<< Y >/dev/null
 assert_equal "$(grep -F -x -c -- "$clean_root" "$CLI_CONFIG/repos")" "1" "add should canonicalize and deduplicate repositories"
 
 REPOSYNC_CONFIG_DIR="$CLI_CONFIG" \
 REPOSYNC_STATE_DIR="$STATE_DIR" \
 REPOSYNC_LOG_DIR="$LOG_DIR" \
 REPOSYNC_WORKER_PATH="$WORKER" \
-"$CLI" remove "$clean" >/dev/null
+"$CLI" remove "$clean" <<< Y >/dev/null
 assert_equal "$(grep -F -x -c -- "$clean_root" "$CLI_CONFIG/repos" || true)" "0" "remove should delete repository"
+
+# Exercise recursive registration without touching the live configuration.
+run_add() {
+    REPOSYNC_CONFIG_DIR="$CLI_CONFIG" \
+    REPOSYNC_STATE_DIR="$STATE_DIR" \
+    REPOSYNC_LOG_DIR="$LOG_DIR" \
+    "$CLI" add "$@"
+}
+scan="$ROOT/scan space"
+mkdir -p "$scan/group" "$scan/empty"
+git init -q -b main "$scan/one"
+git init -q -b main "$scan/group/two"
+git init -q -b main "$scan/.hidden"
+git init -q -b main "$scan/one/nested"
+git init -q --bare "$scan/bare.git"
+ln -s "$scan" "$scan/group/loop"
+ln -s "$clean" "$scan/link"
+one_root=$(cd "$scan/one" && pwd -P)
+two_root=$(cd "$scan/group/two" && pwd -P)
+hidden_root=$(cd "$scan/.hidden" && pwd -P)
+run_add "$scan" <<< N > "$ROOT/decline.out"
+assert_equal "$(cat "$CLI_CONFIG/repos")" "" "N must leave config unchanged"
+assert_contains "$ROOT/decline.out" "$one_root"
+if run_add "$scan" < /dev/null > "$ROOT/eof.out"; then
+    fail "EOF should cancel with a nonzero exit"
+fi
+assert_equal "$(cat "$CLI_CONFIG/repos")" "" "EOF must leave config unchanged"
+printf 'invalid\n\ny\n' | run_add "$scan" "$scan/group" "$scan/one" > "$ROOT/accept.out"
+assert_contains "$ROOT/accept.out" "Please enter Y or N."
+assert_equal "$(wc -l < "$CLI_CONFIG/repos" | tr -d ' ')" "3" "only discovered roots should be added"
+for root in "$one_root" "$two_root" "$hidden_root"; do
+    assert_equal "$(grep -F -x -c -- "$root" "$CLI_CONFIG/repos")" "1" "discovery must deduplicate"
+done
+run_add "$scan" < /dev/null > "$ROOT/duplicate.out"
+assert_contains "$ROOT/duplicate.out" "No new Git working trees to add."
+run_add "$scan/empty" < /dev/null > "$ROOT/empty.out"
+assert_contains "$ROOT/empty.out" "No new Git working trees to add."
+if run_add "$clean" "$ROOT/missing" <<< Y > "$ROOT/invalid.out" 2>&1; then
+    fail "invalid path should fail before registration"
+fi
+assert_equal "$(wc -l < "$CLI_CONFIG/repos" | tr -d ' ')" "3" "invalid batch must add nothing"
+git -C "$clean" worktree add -q -b test-registration "$ROOT/linked tree"
+run_add "$ROOT/linked tree" <<< Y > /dev/null
+linked_root=$(cd "$ROOT/linked tree" && pwd -P)
+assert_contains "$CLI_CONFIG/repos" "$linked_root"
+
+run_remove() {
+    REPOSYNC_CONFIG_DIR="$CLI_CONFIG" \
+    REPOSYNC_STATE_DIR="$STATE_DIR" \
+    REPOSYNC_LOG_DIR="$LOG_DIR" \
+    "$CLI" remove "$@"
+}
+scan_root=$(cd "$scan" && pwd -P)
+printf '# keep this comment\n\n%s\n%s\n' "$scan_root/deleted repo" "$scan_root-sibling/repo" >> "$CLI_CONFIG/repos"
+cp "$CLI_CONFIG/repos" "$ROOT/before-remove"
+run_remove "$scan" <<< n > "$ROOT/remove-no.out"
+cmp "$CLI_CONFIG/repos" "$ROOT/before-remove" || fail "N changed registrations"
+if run_remove "$scan" < /dev/null > "$ROOT/remove-eof.out"; then
+    fail "remove EOF should return nonzero"
+fi
+cmp "$CLI_CONFIG/repos" "$ROOT/before-remove" || fail "EOF changed registrations"
+ln -s "$scan" "$ROOT/scan-alias"
+printf 'invalid\n\ny\n' | run_remove "$ROOT/scan-alias/" "$scan/group" "$scan" > "$ROOT/remove-yes.out"
+assert_contains "$ROOT/remove-yes.out" 'Remove 4 repositories?'
+assert_contains "$ROOT/remove-yes.out" 'Please enter Y or N.'
+assert_contains "$CLI_CONFIG/repos" "$linked_root"
+assert_contains "$CLI_CONFIG/repos" "$scan_root-sibling/repo"
+assert_contains "$CLI_CONFIG/repos" '# keep this comment'
+assert_equal "$(grep -F -c -- "$scan_root/" "$CLI_CONFIG/repos" || true)" "0" "all registered descendants including deleted paths must be removed"
+[ -d "$scan/one/.git" ] || fail "removal deleted repository files"
+run_remove "$scan" < /dev/null > "$ROOT/remove-empty.out"
+assert_contains "$ROOT/remove-empty.out" 'No matching configured repositories'
+run_remove "$scan_root-sibling/repo" <<< Y > /dev/null
+assert_equal "$(grep -F -c -- "$scan_root-sibling/repo" "$CLI_CONFIG/repos" || true)" "0" "missing exact paths remain removable"
+run_remove "$ROOT/linked tree" <<< Y > /dev/null
+assert_equal "$(grep -F -c -- "$linked_root" "$CLI_CONFIG/repos" || true)" "0" "explicit linked worktrees remain removable"
 
 FAKE_HOME="$ROOT/fake & home"
 HOME="$FAKE_HOME" REPOSYNC_SKIP_LAUNCHCTL=1 "$SOURCE_ROOT/install.sh" >/dev/null

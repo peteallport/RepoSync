@@ -28,8 +28,8 @@ Usage:
   reposync resume
   reposync logs [--follow]
   reposync list
-  reposync add <repository>...
-  reposync remove <repository>...
+  reposync add <repository-or-directory>...
+  reposync remove <repository-or-directory>...
   reposync doctor
   reposync uninstall [--purge]
   reposync version
@@ -63,57 +63,158 @@ repository_exists_in_config() {
     grep -F -x -q -- "$root" "$CONFIG_FILE" 2>/dev/null
 }
 
+# Stop at repository roots so nested worktrees and submodules are not enrolled.
+collect_repositories() {
+    local candidate="$1" root child existing
+    if root=$(resolve_repository "$candidate"); then
+        case "$root" in
+            *$'\n'*|*$'\t'*)
+                echo "Unsupported repository path (newline or tab): $candidate" >&2
+                return 1 ;;
+        esac
+        if repository_exists_in_config "$root"; then
+            echo "Already configured: $root"
+            return 0
+        fi
+        for existing in "${pending[@]-}"; do
+            [ "$existing" = "$root" ] && return 0
+        done
+        pending+=("$root")
+        return 0
+    fi
+
+    [ -d "$candidate" ] || {
+        echo "Not a directory or Git working tree: $candidate" >&2
+        return 1
+    }
+    # Bare repositories are not working trees and must not be traversed.
+    if [ "$(git -C "$candidate" rev-parse --is-bare-repository 2>/dev/null)" = true ]; then
+        return 0
+    fi
+    [ -r "$candidate" ] && [ -x "$candidate" ] || {
+        echo "Cannot read directory: $candidate" >&2
+        return 1
+    }
+    for child in "$candidate"/* "$candidate"/.[!.]* "$candidate"/..?*; do
+        [ -d "$child" ] && [ ! -L "$child" ] || continue
+        collect_repositories "$child" || return 1
+    done
+}
+
 command_add() {
-    local candidate root
+    local candidate root answer
+    local -a pending=()
     [ "$#" -gt 0 ] || {
-        echo "reposync add: provide at least one Git repository" >&2
+        echo "reposync add: provide at least one repository or directory" >&2
         return 2
     }
 
-    ensure_local_dirs
     for candidate in "$@"; do
-        root=$(resolve_repository "$candidate") || {
-            echo "Not a Git working tree: $candidate" >&2
-            continue
-        }
+        collect_repositories "$candidate" || return 1
+    done
+    if [ "${#pending[@]}" -eq 0 ]; then
+        echo "No new Git working trees to add."
+        return 0
+    fi
 
-        if repository_exists_in_config "$root"; then
-            echo "Already configured: $root"
-        else
-            printf '%s\n' "$root" >> "$CONFIG_FILE"
+    echo "Repositories to add:"
+    printf '  %s\n' "${pending[@]}"
+    echo "These repositories will be included in scheduled syncs."
+    while true; do
+        printf 'Add %s repositories? [Y/N] ' "${#pending[@]}"
+        if ! IFS= read -r answer; then
+            echo
+            echo "Cancelled; no repositories added."
+            return 1
+        fi
+        case "$answer" in
+            Y|y) break ;;
+            N|n) echo "Cancelled; no repositories added."; return 0 ;;
+            *) echo "Please enter Y or N." ;;
+        esac
+    done
+
+    ensure_local_dirs || return 1
+    for root in "${pending[@]}"; do
+        if ! repository_exists_in_config "$root"; then
+            printf '%s\n' "$root" >> "$CONFIG_FILE" || return 1
             echo "Added: $root"
         fi
     done
 }
 
 command_remove() {
-    local candidate root temp line removed
+    local candidate root temp line existing answer match subtree duplicate
+    local -a pending=()
     [ "$#" -gt 0 ] || {
-        echo "reposync remove: provide at least one repository" >&2
+        echo "reposync remove: provide at least one repository or directory" >&2
         return 2
     }
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "No configured repositories to remove."
+        return 0
+    fi
 
-    ensure_local_dirs
     for candidate in "$@"; do
-        root=$(resolve_repository "$candidate" 2>/dev/null || printf '%s' "$candidate")
-        temp=$(mktemp "$CONFIG_DIR/repos.XXXXXX") || return 1
-        removed=0
-
-        while IFS= read -r line || [ -n "$line" ]; do
-            if [ "$line" = "$root" ]; then
-                removed=1
-            else
-                printf '%s\n' "$line" >> "$temp"
-            fi
-        done < "$CONFIG_FILE"
-
-        mv "$temp" "$CONFIG_FILE"
-        if [ "$removed" -eq 1 ]; then
-            echo "Removed: $root"
+        subtree=0
+        if root=$(resolve_repository "$candidate"); then
+            : # Explicit repositories retain exact-match removal.
+        elif [ -d "$candidate" ]; then
+            root=$(cd "$candidate" && pwd -P) || return 1
+            subtree=1
         else
-            echo "Not configured: $root"
+            # Preserve removal of an exact registered path that no longer exists.
+            root="$candidate"
         fi
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in ""|\#*) continue ;; esac
+            match=0
+            [ "$line" = "$root" ] && match=1
+            if [ "$subtree" -eq 1 ]; then
+                case "$line" in "${root%/}/"*) match=1 ;; esac
+            fi
+            [ "$match" -eq 1 ] || continue
+            duplicate=0
+            for existing in "${pending[@]-}"; do
+                [ "$existing" = "$line" ] && duplicate=1
+            done
+            [ "$duplicate" -eq 1 ] || pending+=("$line")
+        done < "$CONFIG_FILE"
     done
+    if [ "${#pending[@]}" -eq 0 ]; then
+        echo "No matching configured repositories to remove."
+        return 0
+    fi
+
+    echo "Repositories to remove from scheduled syncs:"
+    printf '  %s\n' "${pending[@]}"
+    echo "Repository files will remain on disk."
+    while true; do
+        printf 'Remove %s repositories? [Y/N] ' "${#pending[@]}"
+        if ! IFS= read -r answer; then
+            echo
+            echo "Cancelled; no repositories removed."
+            return 1
+        fi
+        case "$answer" in
+            Y|y) break ;;
+            N|n) echo "Cancelled; no repositories removed."; return 0 ;;
+            *) echo "Please enter Y or N." ;;
+        esac
+    done
+
+    temp=$(mktemp "$CONFIG_DIR/repos.XXXXXX") || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        match=0
+        for root in "${pending[@]}"; do
+            [ "$line" = "$root" ] && match=1
+        done
+        if [ "$match" -eq 0 ]; then
+            printf '%s\n' "$line" >> "$temp" || { rm -f "$temp"; return 1; }
+        fi
+    done < "$CONFIG_FILE"
+    mv "$temp" "$CONFIG_FILE" || { rm -f "$temp"; return 1; }
+    printf 'Removed: %s\n' "${pending[@]}"
 }
 
 command_list() {
